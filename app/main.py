@@ -113,20 +113,28 @@ def get_events(job_id: str) -> list[dict[str, Any]]:
 
 @app.get("/workers", tags=["system"])
 def get_workers() -> dict[str, Any]:
-    """Worker liveness and current lease state, for the demo."""
+    """Worker liveness and current lease state, for the demo.
+
+    The ``workers`` row always names the *current* registered instance of a
+    role: a retired process cannot heartbeat it, so the role cannot look alive
+    on the old process's behalf.
+    """
     now = time.time()
     with reader(settings.db_path) as conn:
         workers = conn.execute(
-            "SELECT worker_id, status, started_at, heartbeat_at FROM workers ORDER BY worker_id"
+            "SELECT worker_id, instance_id, status, started_at, heartbeat_at "
+            "FROM workers ORDER BY worker_id"
         ).fetchall()
         leases = conn.execute(
-            "SELECT job_id, worker_id, epoch, heartbeat_at FROM leases ORDER BY job_id"
+            "SELECT job_id, worker_id, instance_id, epoch, heartbeat_at "
+            "FROM leases ORDER BY job_id"
         ).fetchall()
     return {
         "lease_seconds": settings.lease_seconds,
         "workers": [
             {
                 "worker_id": row["worker_id"],
+                "instance_id": row["instance_id"],
                 "status": row["status"],
                 "started_at": row["started_at"],
                 "heartbeat_at": row["heartbeat_at"],
@@ -139,6 +147,7 @@ def get_workers() -> dict[str, Any]:
             {
                 "job_id": row["job_id"],
                 "worker_id": row["worker_id"],
+                "instance_id": row["instance_id"],
                 "lease_epoch": int(row["epoch"]),
                 "expired": now - float(row["heartbeat_at"]) >= settings.lease_seconds,
                 "seconds_since_heartbeat": round(max(0.0, now - row["heartbeat_at"]), 3),

@@ -158,11 +158,16 @@ def stop_worker(proc: subprocess.Popen, hard: bool = False) -> None:
         proc.wait(timeout=5)
 
 
-def dataset(records: int = 40, seed: int = 21):
+def dataset(records: int = 40, seed: int = 21, epochs: int = 3):
     rng = np.random.default_rng(seed)
     features = rng.normal(size=(records, 4)).tolist()
     labels = [1 if row[0] + row[1] > 0 else 0 for row in features]
-    return {"features": features, "labels": labels, "epochs": 3}
+    return {"features": features, "labels": labels, "epochs": epochs}
+
+
+def replacement_dataset():
+    """Input for the rolling-replacement test, sized to outlast the pauses."""
+    return dataset(records=64, seed=33, epochs=4)
 
 
 @pytest.fixture(scope="module")
@@ -171,6 +176,20 @@ def uninterrupted(tmp_path_factory):
     db = tmp_path_factory.mktemp("reference") / "training.db"
     with Server(db, free_port()) as server:
         job = server.post("/jobs", dataset())
+        worker = start_worker(db, "solo")
+        try:
+            final = wait_completed(server, job["job_id"])
+        finally:
+            stop_worker(worker)
+    return final
+
+
+@pytest.fixture(scope="module")
+def uninterrupted_replacement(tmp_path_factory):
+    """Reference run of the same input as the replacement test."""
+    db = tmp_path_factory.mktemp("reference-replacement") / "training.db"
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", replacement_dataset())
         worker = start_worker(db, "solo")
         try:
             final = wait_completed(server, job["job_id"])
@@ -283,3 +302,123 @@ def test_late_worker_cannot_regress_or_false_complete(tmp_path):
         finally:
             stop_worker(worker_a)
             stop_worker(worker_b)
+
+
+def test_same_name_rolling_replacement_then_other_name_failover(
+    tmp_path, uninterrupted_replacement
+):
+    """The rolling-replacement incident, end to end with real processes.
+
+    1. worker-1 starts training and is paused between batches (still alive,
+       heartbeat stopped, lease *not* expired).
+    2. A new process is started with the same --worker-id worker-1.  It must
+       immediately acquire a fresh lease epoch, without waiting for expiry.
+    3. The old process is resumed.  It must not commit, must not overwrite the
+       new instance's worker status, and on SIGTERM must not delete the new
+       instance's lease.
+    4. The new worker-1 is SIGKILLed.  worker-2 must take over after lease
+       expiry, resume from the last confirmed checkpoint, and produce weights
+       bit-identical to the uninterrupted reference run.
+    """
+    db = tmp_path / "training.db"
+    pause_file = tmp_path / "pause-old"
+    with Server(db, free_port()) as server:
+        job = server.post("/jobs", replacement_dataset())
+        job_id = job["job_id"]
+
+        old_worker = start_worker(
+            db, "worker-1", TRAINING_DEMO_PAUSE_FILE=str(pause_file)
+        )
+        wait_for(
+            lambda: server.get(f"/jobs/{job_id}")["completed_steps"] >= 2,
+            timeout=60,
+            message="old worker-1 progress",
+        )
+        pause_file.write_text("paused")
+        wait_for(
+            lambda: not server.get("/workers")["workers"][0]["alive"],
+            timeout=30,
+            message="old worker-1 heartbeat to stop",
+        )
+        old_lease = server.get("/workers")["leases"][0]
+        # Crucially the old lease has NOT expired yet: the replacement must not
+        # depend on expiry.
+        assert old_lease["expired"] is False
+        old_instance = old_lease["instance_id"]
+        frozen_at = server.get(f"/jobs/{job_id}")
+
+        # New container, same role name, while the old process is still alive.
+        new_worker = start_worker(db, "worker-1")
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                leases = server.get("/workers")["leases"]
+                if leases and leases[0]["instance_id"] != old_instance:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("new worker-1 did not acquire a new lease")
+            new_lease = server.get("/workers")["leases"][0]
+            assert new_lease["worker_id"] == "worker-1"
+            assert new_lease["lease_epoch"] > old_lease["lease_epoch"]
+            new_instance = new_lease["instance_id"]
+            assert new_instance != old_instance
+
+            # Let the new instance commit a few batches before the old wakes.
+            wait_for(
+                lambda: server.get(f"/jobs/{job_id}")["completed_steps"] > frozen_at["completed_steps"],
+                timeout=30,
+                message="new worker-1 progress",
+            )
+            takeover_at = server.get(f"/jobs/{job_id}")
+
+            # Old process resumes: fence must reject it.
+            pause_file.unlink()
+            time.sleep(BATCH_DELAY * 6)
+            after_resume = server.get(f"/jobs/{job_id}")
+            assert after_resume["completed_steps"] >= takeover_at["completed_steps"]
+            checkpoints = server.get(f"/jobs/{job_id}/checkpoints")
+            old_steps = [
+                c["step"] for c in checkpoints if c["instance_id"] == old_instance
+            ]
+            assert all(step <= frozen_at["completed_steps"] for step in old_steps)
+
+            # Graceful stop of the old process: its release must not remove the
+            # new lease, and its heartbeat must not mark the role stopped.
+            stop_worker(old_worker)
+            leases = server.get("/workers")["leases"]
+            assert leases and leases[0]["instance_id"] == new_instance
+            worker_rows = {
+
+                row["worker_id"]: row for row in server.get("/workers")["workers"]
+            }
+            assert worker_rows["worker-1"]["instance_id"] == new_instance
+            assert worker_rows["worker-1"]["status"] != "stopped"
+
+            # Now the new instance dies too; a differently named worker takes
+            # over only after expiry.
+            stop_worker(new_worker, hard=True)
+            survivor = start_worker(db, "worker-2")
+            try:
+                final = wait_completed(server, job_id)
+            finally:
+                stop_worker(survivor)
+
+        finally:
+            stop_worker(old_worker)
+            stop_worker(new_worker)
+
+        assert final["status"] == "completed"
+        assert final["completed_steps"] == final["total_steps"]
+        assert final["final_weights"] == uninterrupted_replacement["final_weights"]
+        assert final["loss"] == uninterrupted_replacement["loss"]
+        assert final["momentum_velocity"] == uninterrupted_replacement["momentum_velocity"]
+
+        checkpoints = server.get(f"/jobs/{job_id}/checkpoints")
+        steps = [c["step"] for c in checkpoints]
+        assert steps == list(range(1, final["total_steps"] + 1))
+        owners = [(c["worker_id"], c["lease_epoch"]) for c in checkpoints]
+        epochs = [epoch for _, epoch in owners]
+        assert epochs == sorted(epochs)
+        assert epochs[-1] > epochs[0]
+        assert "worker-2" in {worker for worker, _ in owners}

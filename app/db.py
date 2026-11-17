@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     batch_loss    REAL NOT NULL,
     committed_at  REAL NOT NULL,
     worker_id     TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
     lease_epoch   INTEGER NOT NULL,
     PRIMARY KEY (job_id, step),
     FOREIGN KEY (job_id) REFERENCES jobs(job_id)
@@ -59,8 +60,13 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at REAL NOT NULL
 );
 
+-- ``instance_id`` identifies one process incarnation.  The role name
+-- (``worker-1``) is stable across restarts, but only the registered instance
+-- may heartbeat or hold leases; a newer instance under the same role retires
+-- the older one.
 CREATE TABLE IF NOT EXISTS workers (
     worker_id    TEXT PRIMARY KEY,
+    instance_id  TEXT NOT NULL DEFAULT '',
     status       TEXT NOT NULL,
     started_at   REAL NOT NULL,
     heartbeat_at REAL NOT NULL
@@ -69,6 +75,7 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE TABLE IF NOT EXISTS leases (
     job_id       TEXT PRIMARY KEY,
     worker_id    TEXT NOT NULL,
+    instance_id  TEXT NOT NULL DEFAULT '',
     epoch        INTEGER NOT NULL,
     heartbeat_at REAL NOT NULL
 );
@@ -131,6 +138,30 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first schema version.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing database untouched, so a
+    volume created by an older build needs explicit ``ALTER TABLE``.  Old rows
+    get ``instance_id=''`` and are superseded as soon as a worker registers.
+    Two containers starting together can race here; ``duplicate column name``
+    means the other process already migrated, which is safe to ignore.
+    """
+    for table in ("workers", "leases", "checkpoints"):
+        columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "instance_id" in columns:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+
+
 def init_db(path: Path | str) -> None:
     """Create the schema if missing.
 
@@ -141,5 +172,6 @@ def init_db(path: Path | str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()

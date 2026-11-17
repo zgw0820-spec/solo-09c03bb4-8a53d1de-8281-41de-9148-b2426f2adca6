@@ -35,6 +35,10 @@ class Worker:
     def __init__(self, settings: Settings, worker_id: str) -> None:
         self.settings = settings
         self.worker_id = worker_id
+        # A process incarnation, distinct from the role name.  A new container
+        # started with the same --worker-id gets a new token and retires the
+        # previous process's ability to heartbeat, renew, commit or release.
+        self.instance_id = uuid.uuid4().hex
         self.stop_event = threading.Event()
         self.lease: Lease | None = None
         self._last_heartbeat = 0.0
@@ -46,8 +50,10 @@ class Worker:
     def beat(self, status: str) -> bool:
         """Publish liveness and renew the lease.
 
-        Returns ``False`` when the lease has been taken over, which the training
-        loop treats as a hard stop.
+        Returns ``False`` when the lease has been taken over or a newer
+        incarnation of this role has registered, which the training loop treats
+        as a hard stop.  The heartbeat itself is scoped to ``instance_id``, so a
+        retired process can never overwrite the successor's worker status.
         """
         now = time.monotonic()
         heartbeat_due = (
@@ -55,7 +61,13 @@ class Worker:
             or now - self._last_heartbeat >= self.settings.heartbeat_interval
         )
         if heartbeat_due:
-            lease_mod.heartbeat(self.settings.db_path, self.worker_id, status)
+            if not lease_mod.heartbeat(
+                self.settings.db_path,
+                self.worker_id,
+                status,
+                self.instance_id,
+            ):
+                return False
             self._last_heartbeat = now
             self._last_status = status
         if self.lease is None:
@@ -65,13 +77,23 @@ class Worker:
     def run(self) -> None:
         self.settings.validate()
         init_db(self.settings.db_path)
-        lease_mod.register_worker(self.settings.db_path, self.worker_id)
+        lease_mod.register_worker(
+            self.settings.db_path, self.worker_id, self.instance_id
+        )
         self.beat("idle")
-        print(f"[{self.worker_id}] started", flush=True)
+        print(
+            f"[{self.worker_id}] started (instance {self.instance_id[:8]})", flush=True
+        )
         try:
             while not self.stop_event.is_set():
                 if not self._run_one_job():
-                    self.beat("idle")
+                    if not self.beat("idle"):
+                        print(
+                            f"[{self.worker_id}] superseded by a newer instance; "
+                            "stopping without touching shared state",
+                            flush=True,
+                        )
+                        break
                     self.stop_event.wait(self.settings.poll_interval)
                     continue
                 try:
@@ -82,8 +104,15 @@ class Worker:
                         self.lease = None
         finally:
             if self.lease is not None:
+                # Scoped to this instance and epoch: a retired process cannot
+                # delete the successor's lease during its own shutdown.
                 lease_mod.release(self.settings.db_path, self.lease)
-            lease_mod.heartbeat(self.settings.db_path, self.worker_id, "stopped")
+                self.lease = None
+            # Also scoped: a retired heartbeat cannot overwrite the new
+            # instance's status.
+            lease_mod.heartbeat(
+                self.settings.db_path, self.worker_id, "stopped", self.instance_id
+            )
             print(f"[{self.worker_id}] stopped", flush=True)
 
     def _run_one_job(self) -> bool:
@@ -94,6 +123,7 @@ class Worker:
                 job_id,
                 self.worker_id,
                 self.settings.lease_seconds,
+                self.instance_id,
             )
             if lease is not None:
                 self.lease = lease
@@ -112,6 +142,7 @@ class Worker:
             "training_started",
             {
                 "worker_id": self.worker_id,
+                "instance_id": self.lease.instance_id,
                 "lease_epoch": self.lease.epoch,
                 "resumed_from_step": job["completed_steps"],
             },
@@ -139,7 +170,11 @@ class Worker:
                     self.settings.db_path,
                     job_id,
                     "lease_lost",
-                    {"worker_id": self.worker_id, "lease_epoch": self.lease.epoch},
+                    {
+                        "worker_id": self.worker_id,
+                        "instance_id": self.lease.instance_id,
+                        "lease_epoch": self.lease.epoch,
+                    },
                 )
                 self.lease = None
                 return

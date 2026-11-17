@@ -6,8 +6,13 @@ database.  A batch commit writes, together and atomically:
 * the checkpoint row: step, weights, momentum, batch loss, dataset loss,
   commit time, worker and lease epoch;
 * the job row: current weights/momentum/loss, ``completed_steps`` and status;
-* the lease heartbeat, proving the committer is still the live owner;
+* the lease heartbeat, proving the committer is still the live owner and the
+  current registered incarnation of its role;
 * the audit event for a completion.
+
+The fence is ``(worker_id, instance_id, epoch)``, so a successor started under
+the same role name retires the previous process immediately, and a differently
+named worker can only take over after lease expiry.
 
 The append-only checkpoint stream is the source of truth.  A restart always
 reloads the newest checkpoint, and progress is only advanced by one inside the
@@ -224,6 +229,7 @@ def list_checkpoints(
             "loss": float(row["loss"]),
             "committed_at": row["committed_at"],
             "worker_id": row["worker_id"],
+            "instance_id": row["instance_id"],
             "lease_epoch": int(row["lease_epoch"]),
         }
         for row in rows
@@ -284,11 +290,15 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
         if row is None:
             raise JobNotFound(lease.job_id)
         if row["status"] == "completed":
+            # Another worker may have committed the final batch between our
+            # renewal and this transaction.  Report the confirmed state; the
+            # caller's loop treats it like its own completion.
             return {
                 "status": "completed",
                 "job_id": lease.job_id,
                 "step": int(row["completed_steps"]),
                 "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+                "loss": float(row["loss"]),
                 "worker_id": lease.worker_id,
                 "lease_epoch": lease.epoch,
             }
@@ -345,8 +355,8 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
             """
             INSERT INTO checkpoints(
                 job_id, step, weights_json, velocity_json, loss, batch_loss,
-                committed_at, worker_id, lease_epoch
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                committed_at, worker_id, instance_id, lease_epoch
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lease.job_id,
@@ -357,18 +367,26 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
                 batch_loss,
                 now,
                 lease.worker_id,
+                lease.instance_id,
                 lease.epoch,
             ),
         )
         conn.execute(
-            "UPDATE leases SET heartbeat_at=? WHERE job_id=?", (now, lease.job_id)
+            "UPDATE leases SET heartbeat_at=? "
+            "WHERE job_id=? AND worker_id=? AND instance_id=? AND epoch=?",
+            (now, lease.job_id, lease.worker_id, lease.instance_id, lease.epoch),
         )
         if final:
             _event(
                 conn,
                 lease.job_id,
                 "job_completed",
-                {"completed_steps": new_completed, "worker_id": lease.worker_id},
+                {
+                    "completed_steps": new_completed,
+                    "worker_id": lease.worker_id,
+                    "instance_id": lease.instance_id,
+                    "lease_epoch": lease.epoch,
+                },
             )
     return {
         "status": "completed" if final else "running",

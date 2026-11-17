@@ -40,6 +40,8 @@ services:
   worker-1:
     build: .
     image: fan-training:latest
+    # The role name is stable across restarts; every process also gets its own
+    # instance_id, so a replacement container fences the previous process.
     command: ["python", "-m", "app.worker", "--worker-id", "worker-1"]
     environment:
       <<: *worker-env
@@ -50,7 +52,8 @@ services:
       api:
         condition: service_healthy
     # No restart policy on purpose: a killed worker stays down so the demo can
-    # show worker-2 taking over. Bring it back with `docker compose start worker-1`.
+    # show worker-2 taking over. Replace it in place with
+    # `docker compose up -d --no-deps --force-recreate worker-1`.
 
   worker-2:
     build: .
@@ -65,6 +68,20 @@ services:
       api:
         condition: service_healthy
     # Same as worker-1: no automatic restart, so failover is observable.
+
+  # Optional rolling-replacement demo.  Not started by default; it would race
+  # worker-1 for the same job:
+  #   docker compose run --rm --no-deps worker-1-replacement
+  worker-1-replacement:
+    build: .
+    image: fan-training:latest
+    profiles: ["replacement"]
+    command: ["python", "-m", "app.worker", "--worker-id", "worker-1"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-1
+    volumes:
+      - training-data:/data
 
 volumes:
   training-data:

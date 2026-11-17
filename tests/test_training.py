@@ -10,7 +10,7 @@ import pytest
 from app import lease as lm
 from app import store
 from app.config import Settings
-from app.db import init_db
+from app.db import init_db, transaction
 from app.features import normalise
 from app.lease import LeaseLost
 from app.model import batch_loss, sgd_step
@@ -272,3 +272,163 @@ def test_reacquired_lease_never_reuses_an_epoch(settings):
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 0
     store.advance_job(settings.db_path, second)
     assert store.get_job(settings.db_path, job["job_id"])["completed_steps"] == 1
+
+
+def test_same_name_successor_supersedes_even_with_fresh_heartbeat(settings):
+    """Rolling replacement: a new process under the same role takes over now.
+
+    The predecessor's heartbeat is still fresh, so an expiry-based takeover
+    would return ``None``; identity, not elapsed time, makes this safe.  The
+    successor gets a new epoch immediately and the predecessor is fenced from
+    every write, renewal and release path.
+    """
+    features, labels = sample(24, seed=8)
+    job = store.create_job(settings.db_path, features, labels, 2)
+    job_id = job["job_id"]
+
+    lm.register_worker(settings.db_path, "worker-1", "old-instance")
+    old = lm.acquire(
+        settings.db_path, job_id, "worker-1", settings.lease_seconds, "old-instance"
+    )
+    assert old is not None and old.epoch == 1
+    store.advance_job(settings.db_path, old)
+    before = store.get_job(settings.db_path, job_id)
+
+    # A replacement container registers the same role name; the old process is
+    # still alive and its lease heartbeat is fresh.
+    lm.register_worker(settings.db_path, "worker-1", "new-instance")
+    assert lm.heartbeat(settings.db_path, "worker-1", "training", "old-instance") is False
+    assert lm.acquire(
+        settings.db_path, job_id, "worker-1", settings.lease_seconds, "old-instance"
+    ) is None
+    assert lm.renew(settings.db_path, old, settings.lease_seconds) is False
+
+    new = lm.acquire(
+        settings.db_path, job_id, "worker-1", settings.lease_seconds, "new-instance"
+    )
+    assert new is not None and new.epoch == old.epoch + 1
+    assert new.instance_id == "new-instance"
+
+    # The retired process cannot commit, even without ever renewing again.
+    with pytest.raises(LeaseLost):
+        store.advance_job(settings.db_path, old)
+    after = store.get_job(settings.db_path, job_id)
+    assert after["completed_steps"] == before["completed_steps"]
+    assert after["weights"] == before["weights"]
+
+    # Its exit-time release must not delete the successor's lease, and its
+    # stop heartbeat must not overwrite the successor's status.
+    lm.release(settings.db_path, old)
+    held = lm.holder(settings.db_path, job_id)
+    assert held is not None
+    assert held[0] == "worker-1" and held[1] == new.epoch
+    with transaction(settings.db_path) as conn:
+        row = conn.execute(
+            "SELECT instance_id, status FROM workers WHERE worker_id='worker-1'"
+        ).fetchone()
+    assert row["instance_id"] == "new-instance"
+    assert row["status"] != "stopped"
+
+    # The successor carries the job to the same final state as an
+    # uninterrupted run.
+    store.advance_job(settings.db_path, new)
+    while True:
+        result = store.advance_job(settings.db_path, new)
+        if result["status"] == "completed":
+            break
+    resumed = store.get_job(settings.db_path, job_id)
+
+    reference_job = store.create_job(settings.db_path, features, labels, 2)
+    lm.register_worker(settings.db_path, "reference", "reference-instance")
+    reference_lease = lm.acquire(
+        settings.db_path,
+        reference_job["job_id"],
+        "reference",
+        settings.lease_seconds,
+        "reference-instance",
+    )
+    while True:
+        result = store.advance_job(settings.db_path, reference_lease)
+        if result["status"] == "completed":
+            break
+    expected = store.get_job(settings.db_path, reference_job["job_id"])
+
+    assert resumed["status"] == "completed"
+    assert resumed["completed_steps"] == resumed["total_steps"]
+    assert resumed["final_weights"] == expected["final_weights"]
+    assert resumed["momentum_velocity"] == expected["momentum_velocity"]
+    assert resumed["loss"] == expected["loss"]
+
+    steps = [c["step"] for c in store.list_checkpoints(settings.db_path, job_id)]
+    assert steps == list(range(1, resumed["total_steps"] + 1))
+    epochs = [c["lease_epoch"] for c in store.list_checkpoints(settings.db_path, job_id)]
+    assert epochs[0] == 1 and epochs[-1] == new.epoch
+    assert epochs == sorted(epochs)
+
+
+def test_other_name_resumes_after_failed_same_name_successor(settings):
+    """If the successor dies too, a differently named worker resumes on expiry.
+
+    The lease chain is old worker-1 (epoch 1) -> new worker-1 (epoch 2) ->
+    worker-2 (epoch 3).  Only the last transition waits for lease expiry;
+    worker-2 restarts from the newest confirmed checkpoint and reproduces the
+    uninterrupted weights exactly.
+    """
+    features, labels = sample(20, seed=12)
+    reference_job = store.create_job(settings.db_path, features, labels, 3)
+    lm.register_worker(settings.db_path, "reference", "ref")
+    ref_lease = lm.acquire(
+        settings.db_path, reference_job["job_id"], "reference", settings.lease_seconds, "ref"
+    )
+    while True:
+        result = store.advance_job(settings.db_path, ref_lease)
+        if result["status"] == "completed":
+            break
+    expected = store.get_job(settings.db_path, reference_job["job_id"])
+
+    job = store.create_job(settings.db_path, features, labels, 3)
+    job_id = job["job_id"]
+    lm.register_worker(settings.db_path, "worker-1", "old-instance")
+    old = lm.acquire(
+        settings.db_path, job_id, "worker-1", settings.lease_seconds, "old-instance"
+    )
+    for _ in range(2):
+        store.advance_job(settings.db_path, old)
+
+    lm.register_worker(settings.db_path, "worker-1", "failed-instance")
+    failed = lm.acquire(
+        settings.db_path, job_id, "worker-1", settings.lease_seconds, "failed-instance"
+    )
+    assert failed is not None and failed.epoch == old.epoch + 1
+    for _ in range(2):
+        store.advance_job(settings.db_path, failed)
+    confirmed = store.get_job(settings.db_path, job_id)
+
+    # The successor crashes without releasing: no heartbeat, no cleanup.
+    with pytest.raises(LeaseLost):
+        store.advance_job(settings.db_path, old)
+    time.sleep(settings.lease_seconds + 0.05)
+
+    lm.register_worker(settings.db_path, "worker-2", "survivor")
+    survivor = lm.acquire(
+        settings.db_path, job_id, "worker-2", settings.lease_seconds, "survivor"
+    )
+    assert survivor is not None and survivor.epoch == failed.epoch + 1
+    resumed_steps = []
+    while True:
+        result = store.advance_job(settings.db_path, survivor)
+        resumed_steps.append(result["step"])
+        if result["status"] == "completed":
+            break
+
+    resumed = store.get_job(settings.db_path, job_id)
+    assert resumed_steps == list(range(confirmed["completed_steps"] + 1, resumed["total_steps"] + 1))
+    assert resumed["status"] == "completed"
+    assert resumed["final_weights"] == expected["final_weights"]
+    assert resumed["momentum_velocity"] == expected["momentum_velocity"]
+    assert resumed["loss"] == expected["loss"]
+    steps = [c["step"] for c in store.list_checkpoints(settings.db_path, job_id)]
+    assert steps == list(range(1, resumed["total_steps"] + 1))
+    epochs = [c["lease_epoch"] for c in store.list_checkpoints(settings.db_path, job_id)]
+    assert epochs == sorted(epochs)
+    assert epochs[2] == old.epoch + 1 and epochs[-1] == survivor.epoch

@@ -80,6 +80,7 @@ def test_query_progress_and_checkpoints(client):
     assert checkpoints[0]["batch_start_index"] == 0
     assert checkpoints[1]["batch_start_index"] == 8
     assert all(c["worker_id"] == "w1" for c in checkpoints)
+    assert all(c["instance_id"] == "w1" for c in checkpoints)
     assert all(len(c["weights"]) == 3 and len(c["momentum_velocity"]) == 3 for c in checkpoints)
     assert checkpoints[0]["training_epoch"] == 1 and checkpoints[0]["batch_in_epoch"] == 1
     assert checkpoints[1]["training_epoch"] == 1 and checkpoints[1]["batch_in_epoch"] == 2
@@ -93,9 +94,11 @@ def test_query_progress_and_checkpoints(client):
 
     workers = client.get("/workers").json()
     assert [w["worker_id"] for w in workers["workers"]] == ["w1"]
+    assert workers["workers"][0]["instance_id"] == "w1"
     assert workers["workers"][0]["alive"] is True
     assert workers["leases"][0]["lease_epoch"] == 1
     assert workers["leases"][0]["worker_id"] == "w1"
+    assert workers["leases"][0]["instance_id"] == "w1"
 
 
 def test_validation_errors(client):

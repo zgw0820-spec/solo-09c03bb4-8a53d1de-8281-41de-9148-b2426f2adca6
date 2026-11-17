@@ -10,6 +10,7 @@
 | --- | --- |
 | `api` | FastAPI，提交任务、查询进度/断点/权重、Swagger 演示 |
 | `worker-1` / `worker-2` | 同一镜像的 `python -m app.worker`，共享同一个 SQLite 文件 |
+| `worker-1-replacement` | 可选（`profiles: ["replacement"]`）的**同名**替换容器，用于演示滚动替换 |
 | `training-data` | Docker 卷，挂载到三个容器的 `/data` |
 
 两个工作器共享**同一个** SQLite 数据库（`/data/training.db`），因此"检查租约并写入
@@ -44,7 +45,7 @@ docker compose up -d --build
 | `GET` | `/jobs/{job_id}` | 已确认步数、进度、损失、当前权重；完成时含 `final_weights` |
 | `GET` | `/jobs/{job_id}/checkpoints` | 全部批次断点（可按 `after_step` 增量拉取） |
 | `GET` | `/jobs/{job_id}/events` | 审计事件：创建、开始/从第几步续训、完成、丢失租约 |
-| `GET` | `/workers` | 工作器心跳与租约持有者 |
+| `GET` | `/workers` | 工作器实例（`instance_id`）、心跳与租约持有者（含实例号） |
 | `GET` | `/health` | 健康检查 |
 
 `Swagger`（`/docs`）里直接 `POST /jobs` 提交即可看到训练开始；`GET /jobs/{id}` 与
@@ -63,6 +64,23 @@ docker compose up -d --build
 4. 完成状态由 `step == total_steps` 在提交事务内一次性置位；旧工作器无法再写入。
 5. SQLite 使用 WAL + `synchronous=FULL`，已提交的断点在进程崩溃/容器重启后仍然存在。
 
+### 同名实例接替（滚动替换）
+
+工作器角色名（`worker-1`）是运维标识，**不是进程身份**。每个进程启动时还会生成随机
+`instance_id`，所有租约授权都校验三元组 `(worker_id, instance_id, epoch)`：
+
+1. `workers` 表按角色名只保存**当前**注册的实例。新进程以同名注册时，旧进程立即被
+   "退休"：它的心跳、续约、断点提交全部失败（`heartbeat`/`renew` 返回 `False`，
+   `advance_job` 抛 `LeaseLost`），因此旧心跳无法覆盖新实例的状态。
+2. 同名接替**不等待租约超时**：新实例领取任务时直接分配从未复用的新 `epoch`，旧实例
+   立刻被围栏挡住。异名工作器仍然必须等持有者心跳超过 `lease_seconds` 才能接管。
+3. `release` 的 `DELETE` 同时匹配 `worker_id`、`instance_id` 和 `epoch`，旧进程退出时
+   删不掉新进程的租约。
+4. 新实例随后也故障（崩溃、不释放租约）时，异名工作器在租约超时后从**最近确认的
+   断点**续训；由于每个断点都原子提交权重/动量/进度，最终权重与不中断训练逐位一致。
+5. 数据库升级：`init_db` 会为旧卷中的 `workers`/`leases`/`checkpoints` 自动补
+   `instance_id` 列（旧行取空串，注册后即被新实例取代），无需手动迁移。
+
 ## 演示与验证
 
 ```bash
@@ -72,11 +90,32 @@ python3 scripts/demo.py
 # 没有 Docker 时用本机进程演示同样流程
 python3 scripts/demo.py --local
 
-# 不依赖 Docker 的三项自检
+# 不依赖 Docker 的四项自检（含同名接替）
 python3 scripts/selftest.py
 
-# 单元/集成测试（含真实 uvicorn + 两个工作器进程、SIGKILL 接管、迟到工作器围栏）
+# 单元/集成测试（含真实 uvicorn + 多个工作器进程、SIGKILL 接管、同名接替、迟到工作器围栏）
 python3 -m pytest -q
+```
+
+同名接替可直接复现（API 需已启动，且与工作器共用同一个 `TRAINING_DB_PATH`）：
+
+```bash
+# 终端 A：观察进度
+curl -s localhost:8000/jobs/<job_id> | python3 -m json.tool
+
+# 终端 B：同名滚动替换 + 新实例再次故障 + 异名接管
+export TRAINING_DB_PATH=/path/to/training.db   # 与 API/Compose 卷中的同一文件
+python3 scripts/replacement_demo.py --api http://127.0.0.1:8000
+```
+
+Docker Compose 下的等价操作：
+
+```bash
+docker compose up -d --build
+# 在 worker-1 正在训练时，再起一个同名容器（旧容器仍在运行也不会再抢占）
+docker compose run --rm --no-deps worker-1-replacement
+# 想模拟替换者随后也故障：在另一个终端 docker kill 该容器（或 Ctrl-C）
+# 之后 worker-2 在租约超时后接管，从最近确认断点续训
 ```
 
 演示脚本第 6 步会用同一份输入再训练一次（不中断），并断言两次的 `final_weights`、
@@ -101,11 +140,12 @@ python3 -m pytest -q
 app/main.py       API 与 Swagger
 app/worker.py     工作器主循环、租约续训
 app/store.py      任务状态机、批次提交、断点查询
-app/lease.py      租约获取/续约/围栏校验
+app/lease.py      租约获取/续约/实例围栏校验
 app/model.py      逻辑回归、交叉熵、SGD + 动量
 app/features.py   输入校验与标准化
-app/db.py         SQLite 连接与表结构
-tests/            单元、API、进程级集成测试
+app/db.py         SQLite 连接与表结构（含旧卷列迁移）
+tests/            单元、API、进程级集成测试（含同名接替）
 scripts/demo.py   Swagger 同款接口的端到端演示
+scripts/replacement_demo.py  同名滚动替换 + 故障续训现场演示
 scripts/selftest.py  无 Docker 自检
 ```

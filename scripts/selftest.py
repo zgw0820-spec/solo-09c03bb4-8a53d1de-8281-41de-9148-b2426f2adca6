@@ -5,7 +5,10 @@
    one shared volume.
 2. ``equivalence``: with real worker processes, kill one mid-training and prove
    the finished weights are bit-identical to an uninterrupted run.
-3. ``late``: a frozen (still-running) old worker cannot write after takeover.
+3. ``same-name``: a replacement process started under the same worker id takes
+   over immediately, the retired process cannot write, overwrite status or
+   release the successor's lease, and a later differently named worker still
+   resumes to bit-identical weights.
 
 Each check prints PASS/FAIL and exits non-zero if anything fails.
 """
@@ -36,15 +39,24 @@ def check_compose() -> bool:
         return True
     config = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
     services = config.get("services", {})
-    workers = [name for name in services if name.startswith("worker-")]
+    workers = [
+        name
+        for name, service in services.items()
+        if name.startswith("worker-") and not service.get("profiles")
+    ]
     assert services["api"]["ports"] == ["8000:8000"], services["api"]["ports"]
-    assert len(workers) == 2, workers
+    assert sorted(workers) == ["worker-1", "worker-2"], workers
     for name in workers:
         volumes = services[name]["volumes"]
         assert volumes == ["training-data:/data"], (name, volumes)
         assert services[name]["command"][-1] == name, services[name]["command"]
     assert services["api"]["volumes"] == ["training-data:/data"]
     assert "training-data" in config["volumes"]
+    replacement = services.get("worker-1-replacement")
+    if replacement is not None:
+        # The replacement must run the *same* role name as worker-1.
+        assert replacement["command"][-1] == "worker-1", replacement["command"]
+        assert replacement.get("profiles"), "replacement must be opt-in"
     print(f"  PASS: compose has api + {workers} sharing volume training-data")
     return True
 
@@ -271,6 +283,122 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_same_name_replacement(tmp: Path) -> bool:
+    """Rolling replacement with a reused worker id, then failover to another."""
+    reference_db = tmp / "same-name-reference.db"
+    api, port = start_api(reference_db)
+    worker = start_worker(reference_db, "solo")
+    try:
+        job = post(port, "/jobs", dataset(seed=33, records=64))
+        reference = completed_state(port, job["job_id"])
+    finally:
+        stop(worker)
+        stop(api)
+
+    db = tmp / "same-name.db"
+    pause = tmp / "pause-old"
+    api, port = start_api(db)
+    job = post(port, "/jobs", dataset(seed=33, records=64))
+    job_id = job["job_id"]
+    old = start_worker(db, "worker-1", TRAINING_DEMO_PAUSE_FILE=str(pause))
+    new = None
+    survivor = None
+    try:
+        wait_for(
+            lambda: get(port, f"/jobs/{job_id}")["completed_steps"] >= 2,
+            60,
+            "old worker-1 progress",
+        )
+        pause.write_text("pause")
+        wait_for(
+            lambda: not get(port, "/workers")["workers"][0]["alive"],
+            30,
+            "old worker-1 heartbeat stop",
+        )
+        old_lease = get(port, "/workers")["leases"][0]
+        assert old_lease["expired"] is False, old_lease
+        old_instance = old_lease["instance_id"]
+        frozen = get(port, f"/jobs/{job_id}")
+
+        new = start_worker(db, "worker-1")
+        wait_for(
+            lambda: (
+                leases := get(port, "/workers")["leases"]
+            )
+            and leases[0]["instance_id"] != old_instance,
+            30,
+            "same-name takeover",
+        )
+        takeover = get(port, "/workers")["leases"][0]
+        assert takeover["worker_id"] == "worker-1"
+        assert takeover["lease_epoch"] > old_lease["lease_epoch"], takeover
+        new_instance = takeover["instance_id"]
+        wait_for(
+            lambda: get(port, f"/jobs/{job_id}")["completed_steps"]
+            > frozen["completed_steps"],
+            30,
+            "successor progress",
+        )
+        before_wake = get(port, f"/jobs/{job_id}")
+
+        pause.unlink()
+        time.sleep(DELAY * 8)
+        after_wake = get(port, f"/jobs/{job_id}")
+        checkpoints_now = get(port, f"/jobs/{job_id}/checkpoints")
+        assert after_wake["completed_steps"] >= before_wake["completed_steps"]
+        assert all(
+            c["step"] <= frozen["completed_steps"]
+            for c in checkpoints_now
+            if c["instance_id"] == old_instance
+        ), "old instance wrote after replacement"
+
+        stop(old)
+        leases = get(port, "/workers")["leases"]
+        assert leases and leases[0]["instance_id"] == new_instance, leases
+        workers = {w["worker_id"]: w for w in get(port, "/workers")["workers"]}
+        assert workers["worker-1"]["instance_id"] == new_instance
+        assert workers["worker-1"]["status"] != "stopped", workers["worker-1"]
+
+        stop(new, hard=True)
+        new = None
+        survivor = start_worker(db, "worker-2")
+        final = completed_state(port, job_id)
+        checkpoints = get(port, f"/jobs/{job_id}/checkpoints")
+        events = get(port, f"/jobs/{job_id}/events")
+    finally:
+        stop(old)
+        if new is not None:
+            stop(new)
+        if survivor is not None:
+            stop(survivor)
+        pause.unlink(missing_ok=True)
+        stop(api)
+
+    steps = [c["step"] for c in checkpoints]
+    assert steps == list(range(1, final["total_steps"] + 1)), steps
+    epochs = [c["lease_epoch"] for c in checkpoints]
+    assert epochs == sorted(epochs), epochs
+    assert epochs[-1] > epochs[0]
+    assert {c["worker_id"] for c in checkpoints} == {"worker-1", "worker-2"}
+    starts = [e for e in events if e["event"] == "training_started"]
+    assert [e["detail"]["worker_id"] for e in starts].count("worker-1") >= 2
+    assert starts[-1]["detail"]["worker_id"] == "worker-2"
+    assert starts[-1]["detail"]["resumed_from_step"] >= frozen["completed_steps"]
+    assert final["final_weights"] == reference["final_weights"], (
+        final["final_weights"],
+        reference["final_weights"],
+    )
+    assert final["loss"] == reference["loss"]
+    assert final["momentum_velocity"] == reference["momentum_velocity"]
+    print(
+        f"  PASS: old worker-1 frozen at step {frozen['completed_steps']},"
+        f" same-name successor fenced it (epoch {old_lease['lease_epoch']} ->"
+        f" {takeover['lease_epoch']}), worker-2 resumed to"
+        f" {final['completed_steps']} with reference weights"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +407,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("same-name replacement", lambda: check_same_name_replacement(tmp)),
         ):
             print(f"[{name}]")
             try:
